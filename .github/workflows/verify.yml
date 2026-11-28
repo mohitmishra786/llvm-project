@@ -1,0 +1,60 @@
+name: verify-label-rebase
+on:
+  push:
+    branches: [verify-label-rebase]
+env:
+  MAIN_SHA: 104e5f4ad90b2cd71466811198ce14116027b97f
+  SUITES: clang/test/Parser clang/test/Sema clang/test/SemaCXX clang/test/C clang/test/CodeGen clang/test/OpenMP
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 345
+    steps:
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - name: Install tools
+        run: sudo apt-get update -q && sudo apt-get install -y -q ninja-build lld
+      - uses: actions/checkout@v4
+        with:
+          repository: llvm/llvm-project
+          ref: ${{ env.MAIN_SHA }}
+          fetch-depth: 1
+          path: src
+      - uses: actions/checkout@v4
+        with:
+          path: ci-src
+      - name: Configure
+        run: |
+          cmake -G Ninja -S src/llvm -B build -DLLVM_ENABLE_PROJECTS=clang \
+            -DCMAKE_BUILD_TYPE=Release -DLLVM_ENABLE_ASSERTIONS=ON -DLLVM_TARGETS_TO_BUILD="X86;AMDGPU;NVPTX" \
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DLLVM_USE_LINKER=lld \
+            -DLLVM_PARALLEL_LINK_JOBS=2 -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF
+      - name: Build main
+        run: ninja -C build clang FileCheck not count split-file opt llc llvm-dis llvm-as llvm-objdump llvm-readobj llvm-nm llvm-config llvm-link llvm-bcanalyzer clang-offload-packager
+      - name: Lit on main
+        run: |
+          mkdir -p logs; cd src
+          ../build/bin/llvm-lit -q --no-progress-bar $SUITES > ../logs/main-suites.txt 2>&1 || true
+          tail -5 ../logs/main-suites.txt
+          grep -E '^  Clang :: ' ../logs/main-suites.txt | sort > ../logs/main-failures.txt || true
+      - name: Apply patch and rebuild
+        run: |
+          cd src
+          git -c user.name=ci -c user.email=ci@localhost am ../ci-src/ci/label.patch
+          git log --format='%h %an %s' -2
+          ninja -C ../build clang
+      - name: Lit with patch
+        run: |
+          cd src
+          ../build/bin/llvm-lit -v --no-progress-bar clang/test/Parser/c2x-label.c clang/test/Parser/cxx2b-label.cpp 2>&1 | tee ../logs/pr-tests.txt
+          ../build/bin/llvm-lit -q --no-progress-bar $SUITES > ../logs/pr-suites.txt 2>&1 || true
+          tail -5 ../logs/pr-suites.txt
+          grep -E '^  Clang :: ' ../logs/pr-suites.txt | sort > ../logs/pr-failures.txt || true
+          echo "main failures: $(wc -l < ../logs/main-failures.txt)  with patch: $(wc -l < ../logs/pr-failures.txt)"
+          diff ../logs/main-failures.txt ../logs/pr-failures.txt && echo IDENTICAL
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs
+          path: logs/

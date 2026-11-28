@@ -1,0 +1,141 @@
+From 7140a6890b249ed4ecbd42ea623195394abe54a1 Mon Sep 17 00:00:00 2001
+From: Mohit Mishra <immadmohit@gmail.com>
+Date: Thu, 19 Nov 2026 15:02:11 +0530
+Subject: [PATCH] [clang] Reject a label with no statement as a substatement
+
+A label may be followed directly by '}' only when it is in a compound
+statement (C23 6.8.2, C++23 [stmt.block]). The parser checked for the
+closing brace without checking where the label was, so it accepted
+`if (a) L: }`, `switch (a) case 1: }` and `switch (a) default: }`.
+
+Only take the label-at-end-of-compound path when the statement context
+is a compound statement. Otherwise fall through to parsing the
+substatement, which reports "expected statement" like GCC does.
+
+Fixes #237246
+---
+ clang/docs/ReleaseNotes.md         |  1 +
+ clang/include/clang/Parse/Parser.h |  8 ++++++++
+ clang/lib/Parse/ParseStmt.cpp      |  7 ++++---
+ clang/test/Parser/c2x-label.c      | 18 ++++++++++++++++++
+ clang/test/Parser/cxx2b-label.cpp  | 18 ++++++++++++++++++
+ 5 files changed, 49 insertions(+), 3 deletions(-)
+
+diff --git a/clang/docs/ReleaseNotes.md b/clang/docs/ReleaseNotes.md
+index 9199647b8..87a649ae4 100644
+--- a/clang/docs/ReleaseNotes.md
++++ b/clang/docs/ReleaseNotes.md
+@@ -1002,6 +1002,7 @@ documentation](CIR/index.md) for more information regarding ClangIR's status and
+ - Fixed `-print-dependency-directives-minimized-source` output for object-like macros starting with '(' so that it is not incorrectly turned into a function-like macro.
+ - Fixed an exponential time-increase bug when collecting argument dependent lookup candidates when the same type is used several times at each level.
+ - Fixed conversion to a C23 enumeration with an underlying type of `bool`, which truncated the value instead of converting it like `bool` (e.g. `(enum E : bool)2` was 0 instead of 1). This also affected compound assignment and increment. (#GH241289)
++- Clang no longer accepts a label, `case` or `default` label with no following statement as the substatement of an `if`, `switch` or loop, such as `if (a) L: }`. A label may only be followed directly by `}` when it appears in a compound statement. (#GH237246)
+ 
+ #### Bug Fixes to Compiler Builtins
+ 
+diff --git a/clang/include/clang/Parse/Parser.h b/clang/include/clang/Parse/Parser.h
+index 4f9087b29..8212d3e5c 100644
+--- a/clang/include/clang/Parse/Parser.h
++++ b/clang/include/clang/Parse/Parser.h
+@@ -7520,6 +7520,14 @@ public:
+ 
+   void DiagnoseLabelAtEndOfCompoundStatement();
+ 
++  /// Whether a label in this context may be followed directly by the closing
++  /// brace, i.e. the label appears in a compound statement rather than as a
++  /// substatement such as the body of an 'if' or 'switch' without braces.
++  static bool isCompoundStatementContext(ParsedStmtContext StmtCtx) {
++    return (StmtCtx & ParsedStmtContext::AllowDeclarationsInC) !=
++           ParsedStmtContext();
++  }
++
+   /// Consume any extra semi-colons resulting in null statements,
+   /// returning true if any tok::semi were consumed.
+   bool ConsumeNullStmt(StmtVector &Stmts);
+diff --git a/clang/lib/Parse/ParseStmt.cpp b/clang/lib/Parse/ParseStmt.cpp
+index 4c3c4e511..00aa143a5 100644
+--- a/clang/lib/Parse/ParseStmt.cpp
++++ b/clang/lib/Parse/ParseStmt.cpp
+@@ -768,7 +768,8 @@ StmtResult Parser::ParseLabeledStatement(ParsedAttributes &Attrs,
+   }
+ 
+   // The label may have no statement following it
+-  if (SubStmt.isUnset() && Tok.is(tok::r_brace)) {
++  if (SubStmt.isUnset() && Tok.is(tok::r_brace) &&
++      isCompoundStatementContext(StmtCtx)) {
+     DiagnoseLabelAtEndOfCompoundStatement();
+     SubStmt = Actions.ActOnNullStmt(ColonLoc);
+   }
+@@ -926,7 +927,7 @@ StmtResult Parser::ParseCaseStatement(ParsedStmtContext StmtCtx,
+   // If we found a non-case statement, start by parsing it.
+   StmtResult SubStmt;
+ 
+-  if (Tok.is(tok::r_brace)) {
++  if (Tok.is(tok::r_brace) && isCompoundStatementContext(StmtCtx)) {
+     // "switch (X) { case 4: }", is valid and is treated as if label was
+     // followed by a null statement.
+     DiagnoseLabelAtEndOfCompoundStatement();
+@@ -975,7 +976,7 @@ StmtResult Parser::ParseDefaultStatement(ParsedStmtContext StmtCtx) {
+ 
+   StmtResult SubStmt;
+ 
+-  if (Tok.is(tok::r_brace)) {
++  if (Tok.is(tok::r_brace) && isCompoundStatementContext(StmtCtx)) {
+     // "switch (X) {... default: }", is valid and is treated as if label was
+     // followed by a null statement.
+     DiagnoseLabelAtEndOfCompoundStatement();
+diff --git a/clang/test/Parser/c2x-label.c b/clang/test/Parser/c2x-label.c
+index f7fcd6e52..a9892e008 100644
+--- a/clang/test/Parser/c2x-label.c
++++ b/clang/test/Parser/c2x-label.c
+@@ -28,3 +28,21 @@ int test_label_in_switch(int v) {
+ 
+     return 0;
+ }
++
++// A label that is the substatement of a selection or iteration statement is
++// not at the end of a compound statement, so it still needs a statement.
++void test_label_as_substatement(int v) {
++  if (v) L1:
++} // c17-error {{expected statement}} c2x-error {{expected statement}}
++
++void test_case_as_substatement(int v) {
++  switch (v) case 1:
++} // c17-error {{expected statement}} c2x-error {{expected statement}}
++
++void test_default_as_substatement(int v) {
++  switch (v) default:
++} // c17-error {{expected statement}} c2x-error {{expected statement}}
++
++void test_label_as_loop_body(int v) {
++  while (v) L2:
++} // c17-error {{expected statement}} c2x-error {{expected statement}}
+diff --git a/clang/test/Parser/cxx2b-label.cpp b/clang/test/Parser/cxx2b-label.cpp
+index a49037040..38ddf00af 100644
+--- a/clang/test/Parser/cxx2b-label.cpp
++++ b/clang/test/Parser/cxx2b-label.cpp
+@@ -29,3 +29,21 @@ int test_label_in_switch(int v) {
+ 
+     return 0;
+ }
++
++// A label that is the substatement of a selection or iteration statement is
++// not at the end of a compound statement, so it still needs a statement.
++void test_label_as_substatement(int v) {
++  if (v) L1:
++} // expected-error {{expected statement}}
++
++void test_case_as_substatement(int v) {
++  switch (v) case 1:
++} // expected-error {{expected statement}}
++
++void test_default_as_substatement(int v) {
++  switch (v) default:
++} // expected-error {{expected statement}}
++
++void test_label_as_loop_body(int v) {
++  while (v) L2:
++} // expected-error {{expected statement}}
+-- 
+2.56.0
+
